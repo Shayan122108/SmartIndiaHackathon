@@ -1,24 +1,23 @@
-plotly
 # requirements.txt
 langchain
 langgraph
-langchain_openai  # Using OpenAI again
+langchain_openai  # Using OpenAI
 pymongo
 sqlalchemy
-psycopg2-binary # For PostgreSQL, or mysql-connector-python for MySQL
+psycopg2-binary   # For PostgreSQL, or mysql-connector-python for MySQL
 fastapi
 uvicorn
-sentence-transformers # For local embeddings
-unstructured[pdf]  # For PDF document processing
-langchain-community  # For document loaders
-faiss-cpu  # For vector storage
-python-dotenv  # For environment variables
+sentence-transformers  # For local embeddings
+unstructured[pdf]      # For PDF document processing
+langchain-community    # For document loaders
+faiss-cpu              # For vector storage
+python-dotenv          # For environment variables
 # Stable PDF parsing on Windows
 pypdf
 twilio
-feedparser     # For RSS parsing
+feedparser             # For RSS parsing
 
-# Local LLM deps (not needed now, but can keep if you want)
+# Local LLM deps
 # transformers
 # torch
 # accelerate

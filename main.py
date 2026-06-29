@@ -1,9 +1,10 @@
 # pyrefly: ignore [missing-import]
 from fastapi import Request
 from tools.whatsapp_tools import send_whatsapp_template
-from fastapi import FastAPI  # Ensure FastAPI is imported
+# pyrefly: ignore [missing-import]
+from fastapi import FastAPI 
 
-# SMS + Government Alert imports (with graceful fallback)
+
 try:
     from tools.sms_tools import (
         send_sms,
@@ -309,40 +310,183 @@ app.add_middleware(
 app.add_middleware(GZipMiddleware, minimum_size=1000)
 
 
-# WhatsApp Webhook Endpoint (registered on the correct app instance)
+# ---------------------------------------------------------------------------
+# Helper: extract plain text from chat_with_agent's return value
+# (it can return AgentResponse OR JSONResponse on errors)
+# ---------------------------------------------------------------------------
+
+def _extract_reply_text(agent_response) -> str:
+    """Safely extract a plain string reply from chat_with_agent's return value."""
+    # Normal case: AgentResponse with .response attribute
+    if hasattr(agent_response, "response"):
+        return str(agent_response.response)
+
+    # Error case: JSONResponse object — decode its body
+    if hasattr(agent_response, "body"):
+        try:
+            import json as _json
+            body = agent_response.body
+            if isinstance(body, bytes):
+                body = body.decode("utf-8")
+            data = _json.loads(body)
+            return str(data.get("response", data.get("message", "An error occurred. Please try again.")))
+        except Exception:
+            pass
+
+    # Last resort
+    return "Sorry, I encountered an error. Please try again."
+
+
+# ---------------------------------------------------------------------------
+# WhatsApp Webhooks
+# ---------------------------------------------------------------------------
+
+@app.get("/webhook/whatsapp", tags=["Integration"])
+async def whatsapp_webhook_verify(request: Request):
+    """
+    Meta webhook verification handshake.
+    Meta sends a GET request with hub.mode, hub.verify_token, hub.challenge.
+    We must return hub.challenge if the verify token matches.
+    """
+    params = request.query_params
+    mode = params.get("hub.mode")
+    token = params.get("hub.verify_token")
+    challenge = params.get("hub.challenge")
+
+    expected_token = os.getenv("WHATSAPP_VERIFY_TOKEN", "")
+    if mode == "subscribe" and token == expected_token:
+        logger.info("WhatsApp webhook verified successfully")
+        from fastapi.responses import PlainTextResponse
+        return PlainTextResponse(content=challenge)
+
+    logger.warning(f"WhatsApp webhook verification failed — token mismatch (got: {token})")
+    raise HTTPException(status_code=403, detail="Webhook verification failed")
+
+
 @app.post("/webhook/whatsapp", tags=["Integration"])
 async def whatsapp_webhook(request: Request):
     """
-    Receives WhatsApp messages via webhook, processes them, and replies back on WhatsApp.
+    Receives inbound WhatsApp messages, runs them through the AI agent,
+    and sends the reply back via WhatsApp Cloud API.
     """
     try:
         data = await request.json()
         entry = data.get("entry", [{}])[0]
         changes = entry.get("changes", [{}])[0]
         value = changes.get("value", {})
-        messages = value.get("messages", [{}])
-        if not messages or not messages[0]:
+
+        # Ignore status-only callbacks (read receipts, delivery reports)
+        if "statuses" in value and "messages" not in value:
+            return {"status": "status_update_ignored"}
+
+        messages = value.get("messages", [])
+        if not messages:
             return {"status": "no message found"}
+
         message = messages[0]
-        user_text = message.get("text", {}).get("body", "")
+        msg_type = message.get("type", "")
+
+        # Only handle text messages for now
+        if msg_type != "text":
+            logger.info(f"Ignoring non-text WhatsApp message of type: {msg_type}")
+            return {"status": f"ignored_type_{msg_type}"}
+
+        user_text = message.get("text", {}).get("body", "").strip()
         sender_number = message.get("from", "")
-        session_id = sender_number
+
+        if not user_text or not sender_number:
+            return {"status": "empty_message"}
+
+        logger.info(f"Inbound WhatsApp from {sender_number}: {user_text[:80]}")
+
         from pydantic import ValidationError
         try:
-            user_query = UserQuery(query=user_text, session_id=session_id)
+            user_query = UserQuery(query=user_text, session_id=sender_number)
         except ValidationError as ve:
             return {"error": "Invalid input", "details": str(ve)}
+
         agent_response = await chat_with_agent(user_query)
-        reply_text = agent_response.response if hasattr(agent_response, "response") else str(agent_response)
-        try:
-            from tools.whatsapp_tools import send_whatsapp_text
-            send_result = send_whatsapp_text(sender_number, reply_text)
-        except ImportError:
-            send_result = send_whatsapp_template(sender_number, template_name="hello_world", language_code="en_US")
-        return {"status": "processed", "user": sender_number, "input": user_text, "output": reply_text, "whatsapp_result": send_result}
+        reply_text = _extract_reply_text(agent_response)[:4090]  # WhatsApp 4096-char limit
+
+        from tools.whatsapp_tools import send_whatsapp_text
+        send_result = send_whatsapp_text(sender_number, reply_text)
+        logger.info(f"WhatsApp reply sent to {sender_number}: {send_result}")
+
+        return {"status": "processed", "user": sender_number, "whatsapp_result": send_result}
+
     except Exception as e:
         logger.error(f"WhatsApp webhook error: {e}")
         return {"error": str(e)}
+
+
+# ---------------------------------------------------------------------------
+# SMS Inbound Webhook (Twilio)
+# ---------------------------------------------------------------------------
+
+@app.post("/webhook/sms", tags=["Integration"])
+async def sms_webhook(request: Request):
+    """
+    Receives inbound SMS messages from Twilio, runs them through the AI agent,
+    and replies back via Twilio SMS.
+    Twilio sends form-encoded data: From, To, Body, etc.
+    Configure this URL in Twilio Console → Phone Numbers → Messaging → Webhook.
+    """
+    try:
+        form_data = await request.form()
+        sender_number = form_data.get("From", "")
+        user_text = form_data.get("Body", "").strip()
+
+        if not sender_number or not user_text:
+            # Return empty TwiML — Twilio requires a valid XML response
+            from fastapi.responses import Response
+            return Response(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response></Response>',
+                media_type="application/xml"
+            )
+
+        logger.info(f"Inbound SMS from {sender_number}: {user_text[:80]}")
+
+        from pydantic import ValidationError
+        try:
+            # Sanitize session_id (strip + and non-alphanumeric for our validator)
+            session_id = "sms_" + "".join(c for c in sender_number if c.isdigit())
+            user_query = UserQuery(query=user_text, session_id=session_id)
+        except ValidationError as ve:
+            logger.error(f"SMS validation error: {ve}")
+            from fastapi.responses import Response
+            return Response(
+                content='<?xml version="1.0" encoding="UTF-8"?><Response><Message>Sorry, I could not process your message.</Message></Response>',
+                media_type="application/xml"
+            )
+
+        agent_response = await chat_with_agent(user_query)
+        reply_text = _extract_reply_text(agent_response)[:1550]  # SMS 1600-char limit
+
+        # Strip markdown formatting for plain SMS
+        import re
+        reply_text = re.sub(r'\*\*(.+?)\*\*', r'\1', reply_text)  # bold
+        reply_text = re.sub(r'\*(.+?)\*', r'\1', reply_text)       # italic
+        reply_text = re.sub(r'#{1,6}\s', '', reply_text)            # headings
+        reply_text = re.sub(r'\[(.+?)\]\(.+?\)', r'\1', reply_text) # links
+
+        logger.info(f"SMS reply to {sender_number}: {reply_text[:80]}...")
+
+        # Respond with TwiML — Twilio reads this and sends the SMS
+        twiml = f'''<?xml version="1.0" encoding="UTF-8"?>
+<Response>
+    <Message>{reply_text}</Message>
+</Response>'''
+
+        from fastapi.responses import Response
+        return Response(content=twiml, media_type="application/xml")
+
+    except Exception as e:
+        logger.error(f"SMS webhook error: {e}")
+        from fastapi.responses import Response
+        return Response(
+            content='<?xml version="1.0" encoding="UTF-8"?><Response><Message>An error occurred. Please try again.</Message></Response>',
+            media_type="application/xml"
+        )
 
 
 # Emergency Mode Endpoints

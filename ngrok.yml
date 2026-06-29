@@ -1,0 +1,9 @@
+version: "3"
+tunnels:
+  health-agent:
+    proto: http
+    addr: 8000
+    inspect: false
+    request_header:
+      add:
+        - "ngrok-skip-browser-warning: true"
